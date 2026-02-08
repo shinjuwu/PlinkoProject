@@ -1,0 +1,6 @@
+{
+    "ServerUrl": "ws://localhost:10101",
+    "WaitWS": 1.1,
+    "UsingDebugTool": true,
+    "canLog": true
+}

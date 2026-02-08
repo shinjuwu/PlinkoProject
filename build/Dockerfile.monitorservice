@@ -1,0 +1,41 @@
+# Dockerfile.monitorservice
+# Multi-stage build for MonitorService (Go 1.18)
+# Build context: project root (D:\work\new\)
+
+# Stage 1: Build
+FROM golang:1.18-alpine AS builder
+
+WORKDIR /app
+
+RUN apk add --no-cache git
+
+# Copy Go module files for dependency caching
+COPY 後台/monitorservice-develop/go.mod ./go.mod
+COPY 後台/monitorservice-develop/go.sum ./go.sum
+RUN go mod download
+
+# Copy full source
+COPY 後台/monitorservice-develop/ ./
+
+# Build binary (entry point is cmd/baseserver/main.go)
+# docs package is already generated (docs.go exists), no need for swag init
+WORKDIR /app/cmd/baseserver
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /monitorservice main.go
+
+# Stage 2: Run
+FROM alpine:latest
+
+WORKDIR /app
+
+RUN apk add --no-cache tzdata ca-certificates curl
+
+# Copy binary (migrations are embedded via //go:embed sql/*)
+COPY --from=builder /monitorservice .
+
+# Config is mounted via volume at /app/config.yml
+EXPOSE 17782 17783
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD curl -so /dev/null http://localhost:17782/ || exit 1
+
+CMD ["./monitorservice"]

@@ -1,0 +1,42 @@
+# Dockerfile.gamehub
+# Multi-stage build for Go GameHub
+# Build context: project root (D:\work\new\)
+
+# Stage 1: Build
+# GameHub go.mod requires Go 1.19
+FROM golang:1.19-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git
+
+# Copy source code (GameHub + collie dependency)
+COPY 遊戲服務器/collie /app/遊戲服務器/collie
+COPY 遊戲服務器/GameHub /app/遊戲服務器/GameHub
+
+WORKDIR /app/遊戲服務器/GameHub
+
+# Download dependencies and build
+RUN go mod download
+RUN go build -o /gamehub main.go
+
+# Stage 2: Run
+FROM alpine:latest
+
+WORKDIR /app
+
+# Install utilities
+RUN apk add --no-cache tzdata ca-certificates curl
+
+# Copy binary
+COPY --from=builder /gamehub .
+
+# Create directories for config and logs
+RUN mkdir -p /app/conf /app/log
+
+# Config is mounted via volume at /app/conf/GameHub.conf
+
+EXPOSE 9643 10101 10201
+
+CMD ["./gamehub", "-conf", "conf/GameHub.conf", "-log", "log"]

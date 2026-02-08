@@ -1,0 +1,33 @@
+# Dockerfile.frontend
+# Multi-stage build for Vue Frontend
+
+# Stage 1: Build
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy Package Files
+COPY 後台/後台前端頁面/dcc_front/frontend/package.json 後台/後台前端頁面/dcc_front/frontend/package-lock.json ./
+
+# Install Dependencies
+RUN npm install
+
+# Copy Source Code
+COPY 後台/後台前端頁面/dcc_front/frontend/ .
+
+# Build (use build-qa as the highest environment available)
+# TODO: Add a "build-prod" script in package.json for production builds
+RUN npm run build-qa
+
+# Stage 2: Serve
+FROM nginx:alpine
+
+# Copy Build Artifacts
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy Nginx Config
+COPY deployment-project/admin-node/configs/nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80 443
+
+CMD ["nginx", "-g", "daemon off;"]

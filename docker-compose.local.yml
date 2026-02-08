@@ -1,0 +1,275 @@
+# docker-compose.local.yml
+# Local integration test: all services on a single network
+# Usage: docker compose -f docker-compose.local.yml up --build
+
+services:
+  # ─── Admin Node Services ───
+
+  admin-postgres:
+    image: postgres:14-alpine
+    container_name: admin-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localtest
+      POSTGRES_DB: dcc_game
+      TZ: "UTC"
+    volumes:
+      - admin_pg_data:/var/lib/postgresql/data
+      - ./configs/init-extra-dbs.sql:/docker-entrypoint-initdb.d/01_init-extra-dbs.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local_net
+
+  admin-redis:
+    image: redis:alpine
+    container_name: admin-redis
+    restart: unless-stopped
+    command: redis-server --requirepass localtest
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "localtest", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local_net
+
+  backend:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.backend
+    container_name: admin-backend
+    restart: unless-stopped
+    depends_on:
+      admin-postgres:
+        condition: service_healthy
+      admin-redis:
+        condition: service_healthy
+      gamehub:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]
+    environment:
+      - TZ=UTC
+      - DB_HOST=admin-postgres
+      - DB_PASSWORD=localtest
+      - GAMEHUB_URL=http://gamehub:9643
+      - ADMIN_HOST=localhost
+      - GAME_CLIENT_BASE=http://localhost:8080
+      - SERVICE_SCHEME=http
+    volumes:
+      - ./configs/config-local.yml:/app/config.yml:ro
+    ports:
+      - "9986:9986"
+    networks:
+      - local_net
+
+  orderservice:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.orderservice
+    container_name: orderservice
+    restart: unless-stopped
+    depends_on:
+      admin-postgres:
+        condition: service_healthy
+      admin-redis:
+        condition: service_healthy
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./configs/orderservice-local.yml:/app/config.yml:ro
+    ports:
+      - "9988:9988"
+    networks:
+      - local_net
+
+  chatservice:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.chatservice
+    container_name: chatservice
+    restart: unless-stopped
+    depends_on:
+      admin-postgres:
+        condition: service_healthy
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./configs/chatservice-local.yml:/app/config.yml:ro
+    ports:
+      - "8896:8896"
+    networks:
+      - local_net
+
+  monitorservice:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.monitorservice
+    container_name: monitorservice
+    restart: unless-stopped
+    depends_on:
+      admin-postgres:
+        condition: service_healthy
+    environment:
+      - TZ=UTC
+    volumes:
+      - ./configs/monitorservice-local.yml:/app/config.yml:ro
+    ports:
+      - "17782:17782"
+      - "17783:17783"
+    networks:
+      - local_net
+
+  frontend:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.frontend
+    container_name: admin-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    volumes:
+      - ./configs/nginx-local.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "80:80"
+    networks:
+      - local_net
+
+  # ─── Game Node Services ───
+
+  game-postgres:
+    image: postgres:14-alpine
+    container_name: game-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localtest
+      POSTGRES_DB: dayon_demo
+      TZ: "UTC"
+    volumes:
+      - game_pg_data:/var/lib/postgresql/data
+      - ./game-node/db-init/gamelist.sql:/docker-entrypoint-initdb.d/01-gamelist.sql:ro
+      - ./game-node/db-init/gameinfo.sql:/docker-entrypoint-initdb.d/02-gameinfo.sql:ro
+      - ./game-node/db-init/lobbyinfo.sql:/docker-entrypoint-initdb.d/03-lobbyinfo.sql:ro
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local_net
+
+  game-redis:
+    image: redis:alpine
+    container_name: game-redis
+    restart: unless-stopped
+    command: redis-server --requirepass localtest
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "localtest", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local_net
+
+  gamehub:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.gamehub
+    container_name: game-hub
+    restart: unless-stopped
+    depends_on:
+      game-postgres:
+        condition: service_healthy
+      game-redis:
+        condition: service_healthy
+    volumes:
+      - ./configs/GameHub.local.conf:/app/conf/GameHub.conf:ro
+    ports:
+      - "9643:9643"
+      - "10101:10101"
+      - "10201:10201"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9643/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - local_net
+
+  game-client:
+    image: nginx:alpine
+    container_name: game-client
+    restart: unless-stopped
+    volumes:
+      - ../遊戲客戶端/plinko/outsource/build:/usr/share/nginx/html
+      - ./configs/game-client-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./configs/game-client-config.json:/usr/share/nginx/html/config.json:ro
+    ports:
+      - "8080:80"
+    networks:
+      - local_net
+
+  # ─── DCC Tools (同花順測試工具) ───
+
+  dcctools-mysql:
+    image: mysql:8.0
+    container_name: dcctools-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: RootPass123!
+      MYSQL_DATABASE: dcc
+      MYSQL_USER: dccuser
+      MYSQL_PASSWORD: Dcc@12345
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - dcctools_mysql_data:/var/lib/mysql
+      - ../後台/測試client(同花順)/dcctools/dump-dcc-202511082114.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./configs/dcctools-init-local.sql:/docker-entrypoint-initdb.d/02-local-fix.sql:ro
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pRootPass123!"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local_net
+
+  dcctools:
+    build:
+      context: ../
+      dockerfile: deployment-project/build/Dockerfile.dcctools
+    container_name: dcctools
+    restart: unless-stopped
+    depends_on:
+      dcctools-mysql:
+        condition: service_healthy
+      orderservice:
+        condition: service_started
+    ports:
+      - "8082:8080"
+    networks:
+      - local_net
+
+volumes:
+  admin_pg_data:
+  game_pg_data:
+  dcctools_mysql_data:
+
+networks:
+  local_net:
+    driver: bridge

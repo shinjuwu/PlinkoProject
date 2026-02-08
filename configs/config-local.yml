@@ -1,0 +1,57 @@
+name: "platform"
+data_dir: "./data-log/"
+shutdown_grace_sec: 5
+
+app:
+  env: "debug"
+  addr: 9986
+  acc_manage_header: "M7NJpSXxh"
+  acc_normal_header: "aikDg57I1"
+  check_header: false
+  use_multipoint: false
+  update_redis_data: true
+  load_front: true
+  load_swagger: false
+  load_db_migration: true
+  load_api_channel: true
+  load_record_channel: true
+  load_casino_channel: true
+  load_backend_channel: true
+  load_job_scheduler: true
+
+jwt:
+  encrypt_string: "#gFn7QSEs5TC9W29B$Gx"
+  issuer: "dcc"
+  expire_time_min: 10080
+
+captcha:
+  key_length: 6
+  img_width: 400
+  img_height: 90
+  gc_limit_number: 10240
+  ExpiredSec: 60
+
+database:
+  driver_name: "postgres"
+  default_db_idx: 0
+  conn_info:
+    - "host=admin-postgres port=5432 user=postgres dbname=dcc_game password=localtest sslmode=disable"
+  migrate_source_url: "file://db/migrations"
+
+logger:
+  stdout: false
+  level: "debug"
+  file: "./data-log/logfile.log"
+  rotation: true
+  max_size: 128
+
+redis:
+  address: "admin-redis:6379"
+  password: "localtest"
+  db_index:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5

@@ -1,0 +1,127 @@
+# Dockerfile.backend
+# Multi-stage build for Go Backend
+# Build context: project root (D:\work\new\)
+
+# Stage 1: Build
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git
+
+# Copy go.work (workspace) and definition module first
+COPY 後台/platform-ete/go.work ./
+COPY 後台/platform-ete/definition/ ./definition/
+
+# Copy Go module files for dependency caching
+COPY 後台/platform-ete/backend/go.mod ./backend/go.mod
+COPY 後台/platform-ete/backend/go.sum ./backend/go.sum
+WORKDIR /app/backend
+RUN go mod download
+
+# Copy full backend source
+COPY 後台/platform-ete/backend/ ./
+
+# Install swag and generate docs
+RUN go install github.com/swaggo/swag/cmd/swag@latest
+RUN swag init
+
+# Build binary
+RUN CGO_ENABLED=0 go build -o /dcc_backend main.go
+
+# Stage 2: Run
+FROM alpine:latest
+
+WORKDIR /app
+
+# Install utilities (postgresql-client needed for entrypoint DB fix)
+RUN apk add --no-cache tzdata ca-certificates curl postgresql-client
+
+# Copy binary
+COPY --from=builder /dcc_backend .
+
+# Copy migration files (needed for load_db_migration)
+COPY --from=builder /app/backend/db/migrations/ ./db/migrations/
+
+# Copy generated swagger docs
+COPY --from=builder /app/backend/docs/ ./docs/
+
+# Create entrypoint script inline (avoids Windows line-ending issues with volume mounts)
+# Environment variables (all have defaults for local Docker):
+#   DB_HOST          - DB hostname (default: admin-postgres)
+#   DB_PASSWORD      - DB password (default: localtest)
+#   DB_USER          - DB user (default: postgres)
+#   DB_NAME          - DB name (default: dcc_game)
+#   GAMEHUB_URL      - GameHub base URL (default: http://gamehub:9643)
+#   ADMIN_HOST       - Admin public host for server_info (default: localhost)
+#   GAME_CLIENT_BASE - Game client h5_link base URL (default: http://localhost:8080)
+#   SERVICE_SCHEME   - http or https (default: http)
+RUN printf '#!/bin/sh\n\
+set -e\n\
+\n\
+DB_HOST="${DB_HOST:-admin-postgres}"\n\
+DB_PASSWORD="${DB_PASSWORD:-localtest}"\n\
+DB_USER="${DB_USER:-postgres}"\n\
+DB_NAME="${DB_NAME:-dcc_game}"\n\
+GAMEHUB_URL="${GAMEHUB_URL:-http://gamehub:9643}"\n\
+ADMIN_HOST="${ADMIN_HOST:-localhost}"\n\
+GAME_CLIENT_BASE="${GAME_CLIENT_BASE:-http://localhost:8080}"\n\
+SERVICE_SCHEME="${SERVICE_SCHEME:-http}"\n\
+\n\
+echo "[entrypoint] Config: DB=$DB_HOST, GAMEHUB=$GAMEHUB_URL, ADMIN=$ADMIN_HOST, SCHEME=$SERVICE_SCHEME"\n\
+\n\
+echo "[entrypoint] Starting backend (first run - migrations)..."\n\
+timeout 30 ./dcc_backend || true\n\
+echo "[entrypoint] First run done. Fixing DB..."\n\
+\n\
+if [ "$SERVICE_SCHEME" = "https" ]; then\n\
+  CHAT_DOMAIN="$ADMIN_HOST"\n\
+  API_DOMAIN="$ADMIN_HOST"\n\
+  MONITOR_DOMAIN="$ADMIN_HOST"\n\
+else\n\
+  CHAT_DOMAIN="${ADMIN_HOST}:8896"\n\
+  API_DOMAIN="${ADMIN_HOST}:9986"\n\
+  MONITOR_DOMAIN="${ADMIN_HOST}:17782"\n\
+fi\n\
+\n\
+GAMEHUB_URL_CLEAN=$(echo "$GAMEHUB_URL" | sed "s:/*$::")\n\
+\n\
+# Write SQL to temp file (avoids shell quoting issues with psql -c)\n\
+echo "UPDATE server_info SET ip = '"'"'${ADMIN_HOST}'"'"', addresses = '"'"'{\"notification\": \"${GAMEHUB_URL_CLEAN}/\"}'"'"', is_enabled = true WHERE code LIKE '"'"'dev%%'"'"';" > /tmp/fix.sql\n\
+echo "UPDATE storage SET value = '"'"'{\"flag\": true, \"update_time\": 0}'"'"' WHERE key = '"'"'GameKillDiveInfoReset'"'"';" >> /tmp/fix.sql\n\
+echo "UPDATE agent SET ip_whitelist = '"'"'[{\"info\":\"deploy\",\"creator\":\"admin\",\"ip_address\":\"*\",\"create_time\":0}]'"'"'::jsonb;" >> /tmp/fix.sql\n\
+echo "UPDATE agent SET api_ip_whitelist = '"'"'[{\"info\":\"deploy\",\"creator\":\"admin\",\"ip_address\":\"*\",\"create_time\":0}]'"'"'::jsonb WHERE top_agent_id <> -1;" >> /tmp/fix.sql\n\
+echo "UPDATE server_info SET ip = '"'"'${ADMIN_HOST}'"'"', addresses = jsonb_set(jsonb_set(addresses, '"'"'{domain}'"'"', '"'"'\"${CHAT_DOMAIN}\"'"'"'), '"'"'{scheme}'"'"', '"'"'\"${SERVICE_SCHEME}\"'"'"') WHERE code = '"'"'chat'"'"';" >> /tmp/fix.sql\n\
+echo "UPDATE server_info SET ip = '"'"'${ADMIN_HOST}'"'"', addresses = jsonb_set(jsonb_set(addresses, '"'"'{domain}'"'"', '"'"'\"${API_DOMAIN}\"'"'"'), '"'"'{scheme}'"'"', '"'"'\"${SERVICE_SCHEME}\"'"'"') WHERE code = '"'"'api'"'"';" >> /tmp/fix.sql\n\
+echo "UPDATE server_info SET ip = '"'"'${ADMIN_HOST}'"'"', addresses = jsonb_set(jsonb_set(addresses, '"'"'{domain}'"'"', '"'"'\"${MONITOR_DOMAIN}\"'"'"'), '"'"'{scheme}'"'"', '"'"'\"${SERVICE_SCHEME}\"'"'"') WHERE code = '"'"'monitor'"'"';" >> /tmp/fix.sql\n\
+echo "UPDATE game SET h5_link = '"'"'${GAME_CLIENT_BASE}'"'"' WHERE server_info_code LIKE '"'"'dev%%'"'"';" >> /tmp/fix.sql\n\
+echo "UPDATE game SET h5_link = '"'"'${GAME_CLIENT_BASE}'"'"' WHERE id IN (0, 3003);" >> /tmp/fix.sql\n\
+\n\
+PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -U "$DB_USER" -d "$DB_NAME" -f /tmp/fix.sql 2>&1 || echo "[entrypoint] WARNING: Failed to update DB"\n\
+rm -f /tmp/fix.sql\n\
+\n\
+echo "[entrypoint] Waiting for GameHub at ${GAMEHUB_URL_CLEAN}/ping ..."\n\
+for i in $(seq 1 60); do\n\
+  if curl -ks "${GAMEHUB_URL_CLEAN}/ping" > /dev/null 2>&1; then\n\
+    echo "[entrypoint] GameHub is ready!"\n\
+    break\n\
+  fi\n\
+  if [ "$i" = "60" ]; then\n\
+    echo "[entrypoint] WARNING: GameHub not ready after 180s, starting anyway..."\n\
+  fi\n\
+  sleep 3\n\
+done\n\
+\n\
+echo "[entrypoint] Starting backend for real..."\n\
+exec ./dcc_backend\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+# Config is mounted via volume, not baked in
+# Mount config.yml to /app/config.yml at runtime
+
+EXPOSE 9986
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD curl -f http://localhost:9986/api/v1/health/health || exit 1
+
+CMD ["./dcc_backend"]

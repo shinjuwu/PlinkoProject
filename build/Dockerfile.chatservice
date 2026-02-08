@@ -1,0 +1,40 @@
+# Dockerfile.chatservice
+# Multi-stage build for ChatService (Go 1.18)
+# Build context: project root (D:\work\new\)
+
+# Stage 1: Build
+FROM golang:1.18-alpine AS builder
+
+WORKDIR /app
+
+RUN apk add --no-cache git
+
+# Copy Go module files for dependency caching
+COPY 後台/chatservice-main/go.mod ./go.mod
+COPY 後台/chatservice-main/go.sum ./go.sum
+RUN go mod download
+
+# Copy full source
+COPY 後台/chatservice-main/ ./
+
+# Build binary (entry point is cmd/baseserver/main.go)
+WORKDIR /app/cmd/baseserver
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /chatservice main.go
+
+# Stage 2: Run
+FROM alpine:latest
+
+WORKDIR /app
+
+RUN apk add --no-cache tzdata ca-certificates curl
+
+# Copy binary (migrations are embedded via //go:embed sql/*)
+COPY --from=builder /chatservice .
+
+# Config is mounted via volume at /app/config.yml
+EXPOSE 8896
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD curl -so /dev/null http://localhost:8896/ || exit 1
+
+CMD ["./chatservice"]

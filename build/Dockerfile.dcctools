@@ -1,0 +1,86 @@
+# Dockerfile.dcctools
+# PHP-based DCC Tools (同花順測試工具)
+# Build context: project root (D:\work\new\)
+
+FROM trafex/php-nginx:latest
+
+# Switch to root for package installation
+USER root
+
+# Install PHP MySQL extension
+RUN apk add --no-cache php83-mysqli
+
+# Copy PHP source code
+COPY 後台/測試client(同花順)/dcctools/ /var/www/html/
+
+# Generate connect_mysql.inc pointing to dcctools-mysql container
+RUN printf '<?php\n\
+$serve = '"'"'dcctools-mysql:3306'"'"';\n\
+$username = '"'"'dccuser'"'"';\n\
+$password = '"'"'Dcc@12345'"'"';\n\
+$dbname = '"'"'dcc'"'"';\n\
+$mysqli = new Mysqli($serve,$username,$password,$dbname);\n\
+if($mysqli->connect_error){\n\
+\tdie('"'"'connect error:'"'"'.$mysqli->connect_errno);\n\
+}\n\
+$mysqli->set_charset('"'"'utf8mb4'"'"');\n\
+?>\n' > /var/www/html/lib/connect_mysql.inc
+
+# Generate config.php pointing to orderservice in Docker network
+RUN printf '<?php\n\
+$SystemName = '"'"'dcc tools'"'"';\n\
+$title = '"'"'DCC 遊戲研發工具'"'"';\n\
+$TimeZone = '"'"'CST'"'"';\n\
+$TimeZoneName = '"'"'北京时间'"'"';\n\
+$NowDate = date("Y-m-d H:i:s");\n\
+$MyIP = UserIP();\n\
+$GoogleAuth = 0;\n\
+$logs_dir = '"'"'/var/www/html/logs/'"'"';\n\
+$Display[1] = "display: none";\n\
+$Display[2] = "display: none";\n\
+$betlogAPI[1] = "http://orderservice:9988/record/getRecordHandle?";\n\
+$version = "1.0.6-local";\n\
+?>\n' > /var/www/html/lib/config.php
+
+# Override nginx config: add extensionless PHP rewrite
+# Original app uses Apache-style URLs without .php extension (e.g. action="welcome")
+RUN printf 'server {\n\
+    listen [::]:8080 default_server;\n\
+    listen 8080 default_server;\n\
+    server_name _;\n\
+    sendfile off;\n\
+    tcp_nodelay on;\n\
+    absolute_redirect off;\n\
+    root /var/www/html;\n\
+    index index.php index.html;\n\
+    location / {\n\
+        try_files $uri $uri/ @extensionless-php;\n\
+    }\n\
+    location @extensionless-php {\n\
+        rewrite ^(.*)$ $1.php last;\n\
+    }\n\
+    location ~ \\.php$ {\n\
+        try_files $uri =404;\n\
+        fastcgi_split_path_info ^(.+\\.php)(/.+)$;\n\
+        fastcgi_pass unix:/run/php-fpm.sock;\n\
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n\
+        fastcgi_index index.php;\n\
+        include fastcgi_params;\n\
+    }\n\
+    location ~* \\.(jpg|jpeg|gif|png|css|js|ico|xml)$ {\n\
+        expires 5d;\n\
+    }\n\
+    location ~ /\\. {\n\
+        log_not_found off;\n\
+        deny all;\n\
+    }\n\
+}\n' > /etc/nginx/conf.d/default.conf
+
+# Ensure logs directory exists and is writable
+RUN mkdir -p /var/www/html/logs && \
+    chown -R nobody:nobody /var/www/html
+
+# Switch back to non-root user
+USER nobody
+
+EXPOSE 8080

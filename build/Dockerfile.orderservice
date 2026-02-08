@@ -1,0 +1,45 @@
+# Dockerfile.orderservice
+# Multi-stage build for OrderService (Go 1.18)
+# Build context: project root (D:\work\new\)
+
+# Stage 1: Build
+FROM golang:1.18-alpine AS builder
+
+WORKDIR /app
+
+RUN apk add --no-cache git
+
+# Copy Go module files for dependency caching
+COPY 後台/orderservice-main/backend/go.mod ./go.mod
+COPY 後台/orderservice-main/backend/go.sum ./go.sum
+RUN go mod download
+
+# Copy full source
+COPY 後台/orderservice-main/backend/ ./
+
+# Build binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dcc_orderservice main.go
+
+# Stage 2: Run
+FROM alpine:latest
+
+WORKDIR /app
+
+RUN apk add --no-cache tzdata ca-certificates curl
+
+# Copy binary
+COPY --from=builder /dcc_orderservice .
+
+# Copy migration files (needed for load_db_migration)
+COPY --from=builder /app/db/migrations/ ./db/migrations/
+
+# Copy swagger docs (compiled into binary via docs package)
+COPY --from=builder /app/docs/ ./docs/
+
+# Config is mounted via volume at /app/config.yml
+EXPOSE 9988
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=5 \
+  CMD curl -so /dev/null http://localhost:9988/ || exit 1
+
+CMD ["./dcc_orderservice"]
