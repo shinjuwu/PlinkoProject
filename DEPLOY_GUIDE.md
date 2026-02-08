@@ -1,6 +1,56 @@
 # 遠端部署完整指南
 
-本文檔基於本地 Docker 整合測試中發現的 25+ 個問題，整理出一次到位的遠端部署流程。
+本文檔基於本地 Docker 整合測試與 GCP 實際部署中發現的 28+ 個問題，整理出一次到位的遠端部署流程。
+
+---
+
+## 快速部署流程 (Step by Step)
+
+> 以下是完整部署的精簡步驟清單。每一步的詳細說明請見對應章節。
+
+```
+前置作業
+  ① 準備兩台 Linux 伺服器（建議 Debian 12 / Ubuntu 22.04，各 4GB+ RAM）
+  ② 記下兩台的 Public IP 和 Internal IP（同 VPC 內網 IP）
+  ③ 確認防火牆允許：TCP 80, 443（對外）+ 內網全通（跨節點 9986, 9643）
+
+安裝環境（兩台都要）
+  ④ 上傳 vm-init.sh 到伺服器：
+     gcloud compute scp deployment-project/vm-init.sh VM_NAME:/tmp/ --zone=ZONE
+  ⑤ SSH 進入伺服器執行：
+     sudo bash /tmp/vm-init.sh     # 安裝 Docker、Docker Compose、常用工具
+
+生成設定檔（在本機執行）
+  ⑥ cd deployment-project && bash setup.sh
+     # 輸入 Public IP、Internal IP、密碼（可留空自動產生）、SSL 憑證路徑（留空自簽）
+  ⑦ 複製遊戲客戶端到 game-node/client-dist/：
+     cp -r ../遊戲客戶端/plinko/outsource/build/* game-node/client-dist/
+  ⑧（可選）壓縮 DB migration：bash squash_db.sh
+
+上傳到伺服器
+  ⑨ 上傳整個專案根目錄到兩台伺服器的 /opt/deploy/
+     # 因為 Docker build 需要原始碼（後台/、遊戲服務器/）
+
+部署（順序重要！）
+  ⑩ 先啟動 Game Node：
+     ssh game-server
+     cd /opt/deploy/deployment-project/game-node
+     sudo docker compose up -d --build
+     sudo docker compose ps          # 等 gamehub 顯示 healthy
+
+  ⑪ 再啟動 Admin Node：
+     ssh admin-server
+     cd /opt/deploy/deployment-project/admin-node
+     sudo docker compose up -d --build
+     sudo docker compose logs -f backend  # 看到 "Starting backend for real..." 即成功
+
+驗證
+  ⑫ 瀏覽器開啟 https://ADMIN_IP/manager
+     → 接受自簽憑證警告 → 登入 dccuser / 12345678
+     → 確認左側選單完整、無白屏
+  ⑬ 瀏覽器開啟 https://GAME_IP/
+     → 確認遊戲頁面可載入（需透過 channelHandle 才能實際遊玩）
+```
 
 ---
 
@@ -16,8 +66,10 @@
 8. [部署 Admin Node（後）](#8-部署-admin-node後)
 9. [驗證部署](#9-驗證部署)
 10. [常見問題 Q&A](#10-常見問題-qa)
-11. [除錯指令速查](#11-除錯指令速查)
-12. [完整 Port 對照表](#12-完整-port-對照表)
+11. [目錄結構](#11-目錄結構)
+12. [本地測試](#12-本地測試)
+13. [除錯指令速查](#13-除錯指令速查)
+14. [完整 Port 對照表](#14-完整-port-對照表)
 
 ---
 
@@ -28,10 +80,10 @@
                     │                   │              │                   │
                     │    Admin Node     │              │    Game Node      │
   瀏覽器 ──────────►│                   │              │                   │◄── 瀏覽器
-                    │  nginx (frontend) │   HTTPS      │  nginx (game-client)
-                    │  ┌───────────────┐│ ─────────►   │  ┌───────────────┐│
-                    │  │/manager (靜態) ││              │  │/      (遊戲)  ││
-                    │  │/agent   (靜態) ││              │  │/ws    → :10101││
+                    │  nginx (frontend) │  HTTP (內網)  │  nginx (game-client)
+                    │  ┌───────────────┐│◄───────────►│  ┌───────────────┐│
+                    │  │/manager (靜態) ││  :9986 ↔    │  │/      (遊戲)  ││
+                    │  │/agent   (靜態) ││      :9643  │  │/ws    → :10101││
                     │  │/api    → :9986 ││              │  │/gamehub→ :9643││
                     │  │/channel→ :9986 ││              │  └───────────────┘│
                     │  │/chatservice.ws ││              │                   │
@@ -52,19 +104,22 @@
 
 ### 核心設計原則
 
-- **每台伺服器只開 80/443 兩個 port**，所有流量走 nginx HTTPS 反向代理
-- 服務間跨節點通訊也走 HTTPS（GameHub → Backend、Backend → GameHub）
+- **對外只開 80/443**，瀏覽器流量走 nginx HTTPS 反向代理
+- **跨節點服務間通訊走 HTTP 內網**（Backend ↔ GameHub 透過 VPC Internal IP，避免自簽憑證 TLS 問題）
+- 額外暴露 port 9986（Admin Node）和 9643（Game Node）供內網直連
 - 資料庫、Redis 不對外暴露，只能 Docker 內網存取
-- 遠端 DB 管理用 SSH tunnel
+- 遠端 DB 管理用 SSH tunnel 或 `docker exec`
 
 ### 跨節點通訊路徑
 
-| 路徑 | 說明 |
-|------|------|
-| GameHub → `https://ADMIN_IP/api/v1/intercom/creategamerecord` | 遊戲結算通知 → admin nginx → backend:9986 |
-| Backend → `https://GAME_IP/gamehub/getdefaultkilldiveinfo` | 遊戲初始化 → game nginx → gamehub:9643 |
-| 瀏覽器 → `wss://GAME_IP/ws` | 遊戲 WebSocket → game nginx → gamehub:10101 |
-| 瀏覽器 → `https://ADMIN_IP/chatservice.ws` | 聊天 WebSocket → admin nginx → chatservice:8896 |
+| 路徑 | 協定 | 說明 |
+|------|------|------|
+| GameHub → `http://ADMIN_INTERNAL_IP:9986/api/v1/intercom/creategamerecord` | HTTP (內網) | 遊戲結算通知 → backend |
+| Backend → `http://GAME_INTERNAL_IP:9643/getdefaultkilldiveinfo` | HTTP (內網) | 遊戲初始化 → gamehub |
+| 瀏覽器 → `wss://GAME_PUBLIC_IP/ws` | WSS (公網) | 遊戲 WebSocket → game nginx → gamehub:10101 |
+| 瀏覽器 → `https://ADMIN_PUBLIC_IP/chatservice.ws` | WSS (公網) | 聊天 WebSocket → admin nginx → chatservice:8896 |
+
+> **正式環境**：使用受信任 SSL 憑證（如 Let's Encrypt）後，跨節點也可以走 HTTPS，不需要暴露額外 port。
 
 ---
 
@@ -74,30 +129,52 @@
 
 | 項目 | Admin Node | Game Node |
 |------|-----------|-----------|
-| 作業系統 | Ubuntu 20.04+ / CentOS 8+ | 同左 |
+| 作業系統 | Debian 12+ / Ubuntu 22.04+ | 同左 |
 | Docker | 20.10+ | 同左 |
-| Docker Compose | v2.0+ | 同左 |
+| Docker Compose | v2.0+ (plugin) | 同左 |
 | 記憶體 | 建議 4GB+ | 建議 2GB+ |
 | 硬碟 | 建議 20GB+ | 建議 10GB+ |
 
-### 2.2 防火牆
+### 2.2 安裝 Docker 環境
 
-兩台伺服器都只需要開放：
+兩台伺服器都需要先安裝 Docker。可使用專案內的 `vm-init.sh`：
 
+```bash
+# 從本機上傳腳本（GCP 範例）
+gcloud compute scp deployment-project/vm-init.sh admin-node:/tmp/ --zone=asia-east1-b
+gcloud compute scp deployment-project/vm-init.sh game-node:/tmp/ --zone=asia-east1-b
+
+# SSH 到各 VM 執行
+gcloud compute ssh admin-node --zone=asia-east1-b
+sudo bash /tmp/vm-init.sh    # 安裝 Docker CE、Docker Compose plugin、curl、htop 等
+```
+
+> **注意**：如果從 Windows 上傳 .sh 檔案，在 Linux 上執行前先轉換換行符號：`sed -i 's/\r$//' /tmp/vm-init.sh`
+
+### 2.3 防火牆
+
+**對外（公網）**：
 ```
 TCP 80   (HTTP → 自動 redirect 到 HTTPS)
-TCP 443  (HTTPS，所有服務的入口)
+TCP 443  (HTTPS，瀏覽器存取入口)
 ```
 
-GCP 防火牆指令可用 `bash gcloud_firewall.sh` 查看。
+**內網（跨節點）**：
+```
+TCP 9986  (Admin Node → Backend API，供 GameHub 結算回呼)
+TCP 9643  (Game Node → GameHub API，供 Backend 初始化)
+```
 
-### 2.3 SSL 憑證
+> GCP 同一 VPC 預設有 `default-allow-internal` 規則，內網 port 自動全通，不需要額外設定。
+> 公網防火牆指令可用 `bash gcloud_firewall.sh` 查看。
+
+### 2.4 SSL 憑證
 
 setup.sh 支援兩種方式：
 - **自簽憑證**：留空自動產生（測試用，瀏覽器會出現警告）
 - **正式憑證**：提供 fullchain.pem + privkey.pem 路徑（如 Let's Encrypt）
 
-### 2.4 本機需要的檔案
+### 2.5 本機需要的檔案
 
 確保專案根目錄下有以下資料夾：
 ```
@@ -149,7 +226,7 @@ admin-node/
 game-node/
   .env                          ← DB/Redis 密碼、IP
   certs/fullchain.pem, privkey.pem  ← SSL 憑證
-  configs/GameHub.conf          ← GameHub 設定（SettlePlatform 指向 HTTPS）
+  configs/GameHub.conf          ← GameHub 設定（SettlePlatform 指向內網 HTTP）
   configs/game-client-config.json ← Plinko 客戶端設定（wss:// WebSocket）
   db-init/gamelist.sql          ← 遊戲列表（從原始碼複製）
   db-init/gameinfo.sql          ← 遊戲設定（從原始碼複製）
@@ -191,10 +268,14 @@ bash squash_db.sh
 ## 5. 準備遊戲客戶端
 
 ```bash
+# 在本機的 deployment-project/ 目錄下執行
 cp -r ../遊戲客戶端/plinko/outsource/build/* game-node/client-dist/
+
+# 確認複製成功
+ls game-node/client-dist/index.html
 ```
 
-確認 `game-node/client-dist/index.html` 存在。
+> **注意**：`setup.sh` 不會自動複製遊戲客戶端，必須手動執行此步驟。如果 `client-dist/` 為空，Game Node 的 nginx 會返回 403。
 
 ---
 
@@ -203,14 +284,21 @@ cp -r ../遊戲客戶端/plinko/outsource/build/* game-node/client-dist/
 因為 Docker build 需要原始碼，必須上傳**整個專案根目錄**：
 
 ```bash
-# 上傳到 Admin Server
+# 方法 1：一般 Linux 伺服器（直接 scp）
 scp -r /path/to/project-root  admin-user@ADMIN_IP:/opt/deploy/
-
-# 上傳到 Game Server
 scp -r /path/to/project-root  game-user@GAME_IP:/opt/deploy/
+
+# 方法 2：GCP Compute Engine（用 gcloud）
+# 先在 VM 上建好目錄
+gcloud compute ssh admin-node --zone=asia-east1-b --command="sudo mkdir -p /opt/deploy && sudo chown \$(whoami) /opt/deploy"
+# 上傳（注意：Windows 的 gcloud scp 用 /tmp/ 比較穩，再 mv 到 /opt/deploy）
+gcloud compute scp --recurse /path/to/project-root admin-node:/opt/deploy/ --zone=asia-east1-b
+# Game Node 同理
 ```
 
-> 專案根目錄 = 包含 `後台/`、`遊戲服務器/`、`deployment-project/` 的那個目錄。Dockerfile 的 build context 是專案根目錄，因為它需要 `COPY 後台/platform-ete/backend/ ...` 等路徑。
+> **專案根目錄** = 包含 `後台/`、`遊戲服務器/`、`deployment-project/` 的那個目錄。Dockerfile 的 build context 是專案根目錄，因為它需要 `COPY 後台/platform-ete/backend/ ...` 等路徑。
+>
+> **Windows 注意**：gcloud scp 使用 pscp，不支援 `~/` 路徑。請用 `/tmp/` 或絕對路徑。
 
 ---
 
@@ -219,21 +307,25 @@ scp -r /path/to/project-root  game-user@GAME_IP:/opt/deploy/
 **必須先啟動 Game Node**，因為 Admin Node 的 Backend 在初始化時需要連線 GameHub。
 
 ```bash
-ssh game-user@GAME_IP
+ssh game-user@GAME_IP       # 或 gcloud compute ssh game-node --zone=ZONE
 cd /opt/deploy/deployment-project/game-node
-docker compose up -d --build
+sudo docker compose up -d --build
 ```
 
 等待所有服務健康：
 ```bash
-docker compose ps
+sudo docker compose ps
 # 確認 gamehub 顯示 (healthy)
 ```
 
 驗證：
 ```bash
-curl -k https://localhost/gamehub/ping
-# 應回傳: pong 或類似回應
+# 從 Game Node 本機測試（HTTP 直連，不經過 nginx）
+curl http://localhost:9643/ping
+# 應回傳: pong
+
+# 從外部測試（HTTPS 經過 nginx）
+curl -k https://GAME_IP/gamehub/ping
 ```
 
 ---
@@ -241,20 +333,20 @@ curl -k https://localhost/gamehub/ping
 ## 8. 部署 Admin Node（後）
 
 ```bash
-ssh admin-user@ADMIN_IP
+ssh admin-user@ADMIN_IP     # 或 gcloud compute ssh admin-node --zone=ZONE
 cd /opt/deploy/deployment-project/admin-node
-docker compose up -d --build
+sudo docker compose up -d --build
 ```
 
-Backend 啟動流程（全自動）：
-1. **第一次啟動**（30 秒 timeout）→ 執行 DB migration → 預期會 crash
+Backend 啟動流程（全自動，由 entrypoint.sh 處理）：
+1. **第一次啟動**（30 秒 timeout）→ 執行 DB migration → 預期會 timeout 退出
 2. **修正 DB** → 用 psql 更新 server_info、game.h5_link、agent whitelist、GameKillDiveInfoReset
-3. **等待 GameHub** → 最多等 180 秒（curl `https://GAME_IP/gamehub/ping`）
+3. **等待 GameHub** → 最多等 180 秒（curl `http://GAME_INTERNAL_IP:9643/ping`）
 4. **第二次啟動** → 正式運行
 
 監控啟動過程：
 ```bash
-docker compose logs -f backend
+sudo docker compose logs -f backend
 ```
 
 看到 `[entrypoint] Starting backend for real...` 後，等幾秒直到看到正常的服務日誌。
@@ -307,7 +399,7 @@ docker compose logs -f backend
 
 常見原因：
 - **DB 連不上**：檢查 `configs/config.yml` 的 `database.conn_info`，host 應為 `postgres`（compose service name），密碼要和 `.env` 一致
-- **GameHub 連不上**：entrypoint 會等 GameHub 最多 180 秒。確認 Game Node 已啟動且 `curl -k https://GAME_IP/gamehub/ping` 有回應
+- **GameHub 連不上**：entrypoint 會等 GameHub 最多 180 秒。確認 Game Node 已啟動且 `curl http://GAME_INTERNAL_IP:9643/ping` 有回應
 - **gameKillInfo 初始化失敗**：Backend 啟動時會從 GameHub 拉取遊戲賠率資料。如果 `server_info` 表裡 `dev01` 的 notification URL 不對，或 GameHub 的遊戲資料表為空，就會失敗
 
 **背景知識**：Backend 有個啟動流程會讀取 `storage.GameKillDiveInfoReset`，如果 `flag: true` 就呼叫 GameHub API 拉遊戲賠率。如果第一次失敗了，flag 會被設為 `false`，後續重啟都不會再試 → 永遠無法初始化。entrypoint 會在每次啟動時重置 flag 為 `true` 來解決這個問題。
@@ -455,13 +547,13 @@ DCC Tools 的 MySQL 中 `agent.agent_id` 欄位要設定為平台子代理的 PK
 **A**: 遊戲結算流程：
 
 ```
-GameHub → POST https://ADMIN_IP/api/v1/intercom/creategamerecord → admin nginx → backend:9986
+GameHub → POST http://ADMIN_INTERNAL_IP:9986/api/v1/intercom/creategamerecord → backend
 Backend → 寫入 dcc_game.game_users_stat + dcc_order.user_play_log
 ```
 
 排查步驟：
 
-1. 確認 GameHub.conf 的 `SettlePlatform.DEV` 指向 `https://ADMIN_IP/`
+1. 確認 GameHub.conf 的 `SettlePlatform.DEV` 指向 `http://ADMIN_INTERNAL_IP:9986/`
 2. 確認 admin nginx 的 `/api` location 正確代理到 backend:9986
 3. 檢查 backend log：
    ```bash
@@ -517,17 +609,19 @@ docker compose up -d --build
 
 ---
 
-### Q11: 自簽憑證導致跨節點 HTTPS 通訊失敗？
+### Q11: 自簽憑證環境下跨節點通訊怎麼處理？
 
-**A**: GameHub 呼叫 Backend（`https://ADMIN_IP/api/...`）和 Backend 呼叫 GameHub（`https://GAME_IP/gamehub/...`）都走 HTTPS。如果使用自簽憑證，Go 的 HTTP client 會拒絕不受信任的憑證。
+**A**: 自簽憑證無法通過 Go 的 TLS 驗證（`x509: certificate signed by unknown authority`）。
 
-Backend entrypoint 中使用 `curl -ks`（`-k` 忽略憑證驗證）來檢查 GameHub 連線。
+**目前的解法**：跨節點服務間通訊改用 **VPC 內網 IP + HTTP**，不走 HTTPS。只有瀏覽器流量走 HTTPS（人可以手動接受憑證警告）。
 
-對於 Go 程式本身：
-- GameHub 的 HTTP client 可能需要設定 `InsecureSkipVerify: true`
-- 如果遇到 TLS 錯誤，檢查 GameHub 和 Backend 的日誌
+- Backend → GameHub：`http://GAME_INTERNAL_IP:9643`（HTTP）
+- GameHub → Backend：`http://ADMIN_INTERNAL_IP:9986`（HTTP）
+- 瀏覽器 → nginx：`https://PUBLIC_IP`（HTTPS，自簽憑證）
 
-**建議**：正式環境使用 Let's Encrypt 等受信任的 SSL 憑證。
+這需要額外暴露 port 9986 和 9643（docker-compose 已設定），且兩台 VM 必須在同一 VPC 內網。
+
+**正式環境**：使用 Let's Encrypt 等受信任 SSL 憑證後，跨節點可直接走 HTTPS，不需要暴露額外 port。詳見 Q26。
 
 ---
 
@@ -568,12 +662,14 @@ ssh -L 5433:localhost:5432 user@GAME_IP
 # 然後在本機連 localhost:5433
 ```
 
-注意：Docker 容器的 postgres 沒有對外 port mapping，但 SSH tunnel 是從伺服器 localhost 連入 Docker bridge network（需要伺服器上的 postgres 有 host port mapping）。
+注意：遠端部署中 postgres 沒有對外 port mapping（只有 Docker 內部網路可達），所以 SSH tunnel 方式無法直接使用。
 
-如果沒有 port mapping，也可以直接 SSH 到伺服器後用 docker exec：
+**推薦方式**：SSH 到伺服器後用 docker exec：
 ```bash
 docker exec -it admin-postgres psql -U postgres -d dcc_game
 ```
+
+如需用 pgAdmin 等 GUI 工具，可以先在 docker-compose.yml 臨時加上 port mapping（`"5432:5432"`），用完再移除。
 
 ---
 
@@ -646,7 +742,7 @@ entrypoint 的設計已經考慮到這點 — 它在 Backend 第一次啟動前�
 使用前確認：
 - DCC Tools 的 MySQL `agent` 表中的 `agent_id` 要和平台子代理的 PK 一致（預設是 5）
 - `md5_key` 和 `aes_key` 也要和平台 agent 表同步
-- `api_server` 表的 URL 指向 `http://backend:9986/channel/channelHandle?`（Docker 內部通訊不需要走 HTTPS）
+- DCC Tools MySQL `api_server` 表的 URL 指向 `http://backend:9986/channel/channelHandle?`（同一 Docker 網路內部通訊，不走 HTTPS）
 
 ---
 
@@ -739,9 +835,9 @@ docker compose restart backend
 
 ---
 
-### Q26: 自簽憑證導致跨節點 HTTPS 通訊失敗（Go TLS 錯誤）？
+### Q26: 自簽憑證導致跨節點 HTTPS 通訊失敗（Go TLS 錯誤）— 技術細節
 
-**A**: Backend（Go 1.22）和 GameHub（Go 1.19）在跨節點 HTTPS 通訊時，會因為自簽憑證出現以下錯誤：
+**A**:（另見 Q11 的簡要說明）Backend（Go 1.22）和 GameHub（Go 1.19）在跨節點 HTTPS 通訊時，會因為自簽憑證出現以下錯誤：
 
 ```
 tls: failed to verify certificate: x509: certificate relies on legacy Common Name field, use SANs instead
@@ -801,7 +897,96 @@ GameHub → http://INTERNAL_IP:9986 → backend (HTTP, VPC 內網)
 
 ---
 
-## 11. 除錯指令速查
+## 11. 目錄結構
+
+```
+deployment-project/
+├── setup.sh                    # [Step 1] 生成所有設定檔
+├── squash_db.sh                # [Step 2] 壓縮 DB migration（可選）
+├── gcloud_firewall.sh          # [Step 3] GCP 防火牆指令參考
+├── vm-init.sh                  # GCP VM 環境初始化（裝 Docker）
+├── docker-compose.local.yml    # 本地測試用（全部服務跑在一台）
+├── local-test.sh               # 本地測試輔助腳本
+├── test-login.sh               # 登入測試腳本
+├── DEPLOY_GUIDE.md             # 本文件（部署完整指南）
+├── DEPLOYMENT_REPORT.md        # 客戶交付報告
+├── build/                      # Dockerfiles（共用）
+│   ├── Dockerfile.backend
+│   ├── Dockerfile.frontend
+│   ├── Dockerfile.gamehub
+│   ├── Dockerfile.orderservice
+│   ├── Dockerfile.chatservice
+│   ├── Dockerfile.monitorservice
+│   └── Dockerfile.dcctools
+├── configs/                    # 本地測試用設定檔（靜態）
+│   ├── config-local.yml        # Backend 本地設定
+│   ├── orderservice-local.yml
+│   ├── chatservice-local.yml
+│   ├── monitorservice-local.yml
+│   ├── GameHub.local.conf
+│   ├── nginx-local.conf        # HTTP 反向代理（本地）
+│   ├── game-client-nginx.conf
+│   ├── game-client-config.json
+│   ├── backend-entrypoint.sh
+│   ├── init-extra-dbs.sql
+│   └── dcctools-init-local.sql
+├── admin-node/                 # 部署到 Admin Server
+│   ├── docker-compose.yml
+│   ├── .env                    # setup.sh 生成
+│   ├── certs/                  # SSL 憑證
+│   ├── configs/
+│   │   ├── nginx.conf          # HTTPS 反向代理
+│   │   ├── config.yml          # Backend（setup.sh 生成）
+│   │   ├── orderservice.yml
+│   │   ├── chatservice.yml
+│   │   └── monitorservice.yml
+│   ├── db-init/
+│   │   ├── init-extra-dbs.sql  # 建立 dcc_order, dcc_chat, monitor
+│   │   ├── dcctools-schema.sql # MySQL schema（setup.sh 複製）
+│   │   └── dcctools-init.sql   # MySQL 資料修正
+│   └── scripts/
+│       ├── update_server_info.sql  # setup.sh 生成
+│       └── update_game_data.sql    # setup.sh 生成
+└── game-node/                  # 部署到 Game Server
+    ├── docker-compose.yml
+    ├── .env                    # setup.sh 生成
+    ├── certs/                  # SSL 憑證
+    ├── configs/
+    │   ├── GameHub.conf        # setup.sh 生成
+    │   ├── game-client-nginx.conf
+    │   └── game-client-config.json  # setup.sh 生成
+    ├── db-init/
+    │   ├── gamelist.sql        # setup.sh 複製
+    │   ├── gameinfo.sql
+    │   └── lobbyinfo.sql
+    └── client-dist/            # 遊戲客戶端靜態檔案
+```
+
+---
+
+## 12. 本地測試
+
+使用 `docker-compose.local.yml` 在單機上跑全部服務（不需要兩台伺服器）：
+
+```bash
+cd deployment-project
+docker compose -f docker-compose.local.yml up --build
+```
+
+存取方式：
+- 管理後台：`http://localhost/manager`
+- 遊戲客戶端：`http://localhost:8080`
+- DCC Tools：`http://localhost:8082`
+
+本地測試與遠端部署的差異：
+- HTTP（無 SSL）
+- 所有服務 port 直接暴露（方便除錯）
+- 設定檔在 `configs/` 目錄（`*-local.yml`、`nginx-local.conf`）
+- `server_info` 的 domain 用 `localhost:PORT`（瀏覽器直連各服務）
+
+---
+
+## 13. 除錯指令速查
 
 ```bash
 # ─── 查看服務狀態 ───
@@ -848,7 +1033,7 @@ docker compose up -d --build
 
 ---
 
-## 12. 完整 Port 對照表
+## 14. 完整 Port 對照表
 
 ### 遠端部署（只暴露 80/443）
 
