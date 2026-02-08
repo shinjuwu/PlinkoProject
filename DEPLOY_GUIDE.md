@@ -27,9 +27,12 @@
      cp -r ../遊戲客戶端/plinko/outsource/build/* game-node/client-dist/
   ⑧（可選）壓縮 DB migration：bash squash_db.sh
 
-上傳到伺服器
-  ⑨ 上傳整個專案根目錄到兩台伺服器的 /opt/deploy/
-     # 因為 Docker build 需要原始碼（後台/、遊戲服務器/）
+上傳到伺服器（詳見 Section 6）
+  ⑨ 上傳到兩台伺服器的 /opt/deploy/：
+     Admin Node 需要：後台/、deployment-project/
+     Game Node  需要：遊戲服務器/、deployment-project/
+     # 最簡單：兩台都傳整個專案根目錄
+  ⑨b SSH 到各 VM 執行驗證（ls 確認目錄齊全，特別是 .env 和 certs/）
 
 部署（順序重要！）
   ⑩ 先啟動 Game Node：
@@ -281,24 +284,102 @@ ls game-node/client-dist/index.html
 
 ## 6. 上傳到伺服器
 
-因為 Docker build 需要原始碼，必須上傳**整個專案根目錄**：
+### 6.1 為什麼要上傳整個專案？
+
+Docker build 的 context 是**專案根目錄**，Dockerfile 中使用相對路徑引用原始碼（如 `COPY 後台/platform-ete/backend/ ./`）。如果只上傳 `deployment-project/`，build 會因為找不到原始碼而失敗。
+
+### 6.2 各節點需要的目錄
+
+| 目錄 | Admin Node | Game Node | 說明 |
+|------|:----------:|:---------:|------|
+| `deployment-project/` | **必須** | **必須** | Dockerfiles、docker-compose、設定檔 |
+| `後台/platform-ete/` | **必須** | - | Backend API 原始碼 |
+| `後台/orderservice-main/` | **必須** | - | OrderService 原始碼 |
+| `後台/chatservice-main/` | **必須** | - | ChatService 原始碼 |
+| `後台/monitorservice-develop/` | **必須** | - | MonitorService 原始碼 |
+| `後台/後台前端頁面/dcc_front/frontend/` | **必須** | - | 前端 Vue 原始碼 |
+| `後台/測試client(同花順)/dcctools/` | **必須** | - | DCC Tools PHP 原始碼 |
+| `遊戲服務器/GameHub/` | - | **必須** | GameHub 原始碼 |
+| `遊戲服務器/collie/` | - | **必須** | GameHub 依賴的 collie 模組 |
+
+> **最簡單做法**：兩台都上傳整個專案根目錄，不用區分。磁碟空間足夠的話這樣最不容易漏。
+
+### 6.3 上傳步驟
 
 ```bash
-# 方法 1：一般 Linux 伺服器（直接 scp）
-scp -r /path/to/project-root  admin-user@ADMIN_IP:/opt/deploy/
-scp -r /path/to/project-root  game-user@GAME_IP:/opt/deploy/
+# ─── 步驟 1：在兩台 VM 上建立目標目錄 ───
+# Admin Node
+gcloud compute ssh admin-node --zone=asia-east1-b \
+  --command="sudo mkdir -p /opt/deploy && sudo chown \$(whoami) /opt/deploy"
+# Game Node
+gcloud compute ssh game-node --zone=asia-east1-b \
+  --command="sudo mkdir -p /opt/deploy && sudo chown \$(whoami) /opt/deploy"
 
-# 方法 2：GCP Compute Engine（用 gcloud）
-# 先在 VM 上建好目錄
-gcloud compute ssh admin-node --zone=asia-east1-b --command="sudo mkdir -p /opt/deploy && sudo chown \$(whoami) /opt/deploy"
-# 上傳（注意：Windows 的 gcloud scp 用 /tmp/ 比較穩，再 mv 到 /opt/deploy）
-gcloud compute scp --recurse /path/to/project-root admin-node:/opt/deploy/ --zone=asia-east1-b
-# Game Node 同理
+# ─── 步驟 2：上傳檔案 ───
+# 假設本機專案根目錄是 D:\work\new（Windows）或 /home/user/project（Linux）
+
+# 方法 A：GCP gcloud scp（推薦）
+gcloud compute scp --recurse "D:\work\new\後台" admin-node:/opt/deploy/後台 --zone=asia-east1-b
+gcloud compute scp --recurse "D:\work\new\deployment-project" admin-node:/opt/deploy/deployment-project --zone=asia-east1-b
+gcloud compute scp --recurse "D:\work\new\遊戲服務器" game-node:/opt/deploy/遊戲服務器 --zone=asia-east1-b
+gcloud compute scp --recurse "D:\work\new\deployment-project" game-node:/opt/deploy/deployment-project --zone=asia-east1-b
+
+# 方法 B：打包後上傳（更快，推薦大專案）
+# 本機打包
+tar czf /tmp/project.tar.gz -C "D:\work\new" 後台 遊戲服務器 deployment-project
+# 上傳到兩台 VM
+gcloud compute scp /tmp/project.tar.gz admin-node:/tmp/ --zone=asia-east1-b
+gcloud compute scp /tmp/project.tar.gz game-node:/tmp/ --zone=asia-east1-b
+# SSH 到各 VM 解壓
+tar xzf /tmp/project.tar.gz -C /opt/deploy/
+
+# 方法 C：一般 Linux 伺服器（直接 scp）
+scp -r /path/to/project-root/  admin-user@ADMIN_IP:/opt/deploy/
+scp -r /path/to/project-root/  game-user@GAME_IP:/opt/deploy/
 ```
 
-> **專案根目錄** = 包含 `後台/`、`遊戲服務器/`、`deployment-project/` 的那個目錄。Dockerfile 的 build context 是專案根目錄，因為它需要 `COPY 後台/platform-ete/backend/ ...` 等路徑。
->
-> **Windows 注意**：gcloud scp 使用 pscp，不支援 `~/` 路徑。請用 `/tmp/` 或絕對路徑。
+### 6.4 上傳後驗證（重要！）
+
+SSH 到各 VM，確認目錄結構正確：
+
+```bash
+# ─── Admin Node 檢查 ───
+ls /opt/deploy/
+# 應看到：後台/  deployment-project/  （Game Node 還會有 遊戲服務器/）
+
+ls /opt/deploy/後台/
+# 應看到：platform-ete/  orderservice-main/  chatservice-main/
+#         monitorservice-develop/  後台前端頁面/  測試client(同花順)/
+
+ls /opt/deploy/deployment-project/admin-node/
+# 應看到：docker-compose.yml  .env  certs/  configs/  db-init/  scripts/
+
+ls /opt/deploy/deployment-project/admin-node/.env
+# 應存在（由 setup.sh 生成），如果不存在代表 setup.sh 沒跑或沒上傳
+
+# ─── Game Node 檢查 ───
+ls /opt/deploy/遊戲服務器/
+# 應看到：GameHub/  collie/
+
+ls /opt/deploy/deployment-project/game-node/
+# 應看到：docker-compose.yml  .env  certs/  configs/  db-init/  client-dist/
+
+ls /opt/deploy/deployment-project/game-node/client-dist/index.html
+# 應存在（步驟 5 手動複製），如果不存在遊戲頁面會 403
+```
+
+### 6.5 常見漏傳問題
+
+| 漏傳的東西 | 報錯訊息 | 解法 |
+|-----------|---------|------|
+| `後台/platform-ete/` | `COPY failed: file not found` (backend build) | 上傳 `後台/` 整個目錄 |
+| `遊戲服務器/collie/` | `COPY failed: file not found` (gamehub build) | 上傳 `遊戲服務器/collie/` |
+| `deployment-project/admin-node/.env` | `variable is not set` | 重新跑 `setup.sh` 或手動上傳 |
+| `deployment-project/admin-node/certs/` | nginx 啟動失敗 `cannot load certificate` | 重新跑 `setup.sh`（會生成自簽憑證） |
+| `game-node/client-dist/` 為空 | 遊戲頁面 403 Forbidden | 執行步驟 5 複製遊戲客戶端 |
+| `game-node/db-init/*.sql` | 遊戲顯示 "Game is close" | 重新跑 `setup.sh`（會複製 SQL） |
+
+> **Windows 注意**：`gcloud compute scp` 底層用 pscp，不支援 `~/` 路徑，請用 `/tmp/` 或 `/opt/deploy/`。
 
 ---
 
